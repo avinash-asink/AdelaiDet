@@ -38,11 +38,78 @@ from detectron2.modeling import GeneralizedRCNNWithTTA
 from detectron2.utils.logger import setup_logger
 
 from adet.data.dataset_mapper import DatasetMapperWithBasis
-from adet.data.fcpose_dataset_mapper import FCPoseDatasetMapper
+#from adet.data.fcpose_dataset_mapper import FCPoseDatasetMapper
 from adet.config import get_cfg
 from adet.checkpoint import AdetCheckpointer
 from adet.evaluation import TextEvaluator
 
+
+from detectron2.engine.hooks import HookBase
+from detectron2.utils.logger import log_every_n_seconds
+from detectron2.data import DatasetMapper, build_detection_test_loader
+import detectron2.utils.comm as comm
+import time
+import datetime
+import numpy as np
+
+class LossEvalHook(HookBase):
+    def __init__(self, eval_period, model, data_loader):
+        self._model = model
+        self._period = eval_period
+        self._data_loader = data_loader
+
+    def _do_loss_eval(self):
+        # Copying inference_on_dataset from evaluator.py
+        total = len(self._data_loader)
+        num_warmup = min(5, total - 1)
+
+        start_time = time.perf_counter()
+        total_compute_time = 0
+        losses = []
+        for idx, inputs in enumerate(self._data_loader):
+            if idx == num_warmup:
+                start_time = time.perf_counter()
+                total_compute_time = 0
+            start_compute_time = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            total_compute_time += time.perf_counter() - start_compute_time
+            iters_after_start = idx + 1 - num_warmup * int(idx >= num_warmup)
+            seconds_per_img = total_compute_time / iters_after_start
+            if idx >= num_warmup * 2 or seconds_per_img > 5:
+                total_seconds_per_img = (time.perf_counter() - start_time) / iters_after_start
+                eta = datetime.timedelta(seconds=int(total_seconds_per_img * (total - idx - 1)))
+                log_every_n_seconds(
+                    logging.INFO,
+                    "Loss on Validation  done {}/{}. {:.4f} s / img. ETA={}".format(
+                        idx + 1, total, seconds_per_img, str(eta)
+                    ),
+                    n=5,
+                )
+            loss_batch = self._get_loss(inputs)
+            losses.append(loss_batch)
+        mean_loss = np.mean(losses)
+        self.trainer.storage.put_scalar('validation_loss', mean_loss)
+        comm.synchronize()
+
+        return losses
+
+    def _get_loss(self, data):
+        # How loss is calculated on train_loop
+        metrics_dict = self._model(data)
+        metrics_dict = {
+            k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else float(v)
+            for k, v in metrics_dict.items()
+        }
+        total_losses_reduced = sum(loss for loss in metrics_dict.values())
+        return total_losses_reduced
+
+    def after_step(self):
+        next_iter = self.trainer.iter + 1
+        is_final = next_iter == self.trainer.max_iter
+        if is_final or (self._period > 0 and next_iter % self._period == 0):
+            self._do_loss_eval()
+        self.trainer.storage.put_scalars(timetest=12)
 
 class Trainer(DefaultTrainer):
     """
@@ -66,8 +133,17 @@ class Trainer(DefaultTrainer):
                     scheduler=self.scheduler,
                 )
                 ret[i] = hooks.PeriodicCheckpointer(self.checkpointer, self.cfg.SOLVER.CHECKPOINT_PERIOD)
+        ret.insert(-1, LossEvalHook(
+            self.cfg.TEST.EVAL_PERIOD,
+            self.model,
+            build_detection_test_loader(
+                self.cfg,
+                self.cfg.DATASETS.TEST[0],
+                DatasetMapper(self.cfg, True)
+            )
+        ))
         return ret
-    
+
     def resume_or_load(self, resume=True):
         checkpoint = self.checkpointer.resume_or_load(self.cfg.MODEL.WEIGHTS, resume=resume)
         if resume and self.checkpointer.has_checkpoint():
@@ -113,10 +189,7 @@ class Trainer(DefaultTrainer):
         It calls :func:`detectron2.data.build_detection_train_loader` with a customized
         DatasetMapper, which adds categorical labels as a semantic mask.
         """
-        if cfg.MODEL.FCPOSE_ON:
-            mapper = FCPoseDatasetMapper(cfg, True)
-        else:
-            mapper = DatasetMapperWithBasis(cfg, True)
+        mapper = DatasetMapperWithBasis(cfg, True)
         return build_detection_train_loader(cfg, mapper=mapper)
 
     @classmethod
@@ -186,6 +259,11 @@ def setup(args):
     cfg = get_cfg()
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    cfg.DATALOADER.NUM_WORKERS = 1
+    cfg.SOLVER.IMS_PER_BATCH = 8
+    cfg.SOLVER.CHECKPOINT_PERIOD = 1000
+    cfg.MODEL.SOLOV2.NUM_CLASSES = 3 #foreground class count + background class
+    cfg.TEST.EVAL_PERIOD = 1000
     cfg.freeze()
     default_setup(cfg, args)
 
@@ -196,6 +274,13 @@ def setup(args):
 
 
 def main(args):
+    from detectron2.data.datasets import register_coco_instances
+    register_coco_instances("kitchen_dataset_train", {},
+                            "/content/AdelaiDet/datasets/batch_4_4_17_01_22/train_coco/annotations.json",
+                            "/content/AdelaiDet/datasets/batch_4_4_17_01_22/train_coco/")
+    register_coco_instances("kitchen_dataset_val", {},
+                            "/content/AdelaiDet/datasets/batch_4_4_17_01_22/val_coco/annotations.json",
+                            "/content/AdelaiDet/datasets/batch_4_4_17_01_22/val_coco/")
     cfg = setup(args)
 
     if args.eval_only:
@@ -203,7 +288,7 @@ def main(args):
         AdetCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = Trainer.test(cfg, model) # d2 defaults.py
+        res = Trainer.test(cfg, model)  # d2 defaults.py
         if comm.is_main_process():
             verify_results(cfg, res)
         if cfg.TEST.AUG.ENABLED:
@@ -214,6 +299,7 @@ def main(args):
     If you'd like to do anything fancier than the standard training logic,
     consider writing your own training loop or subclassing the trainer.
     """
+
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
     if cfg.TEST.AUG.ENABLED:
